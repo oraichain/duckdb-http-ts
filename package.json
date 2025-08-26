@@ -1,6 +1,6 @@
 {
-  "name": "duckdb-http",
-  "version": "1.0.0",
+  "name": "@oraichain/duckdb-http",
+  "version": "1.0.1",
   "description": "Connect to DuckDB over the HTTP protocol, allowing multiple processes to read and write concurrently",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
