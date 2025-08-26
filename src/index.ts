@@ -7,6 +7,7 @@ export type TableData = RowData[];
 export interface ConnectionOptions {
   baseUrl: string;
   apiKey?: string;
+  cacheTTL?: number; // optional cache duration in ms
 }
 
 export interface QueryResult {
@@ -23,8 +24,7 @@ export interface QueryResult {
   };
 }
 
-// Universal DuckDB -> JavaScript type mapper
-function convertDuckDBValue(value: string, type: string) {
+function convertDuckDBValue(value: any, type: string) {
   if (value === null || value === undefined) return null;
 
   switch (type.toLowerCase()) {
@@ -43,70 +43,55 @@ function convertDuckDBValue(value: string, type: string) {
     case 'bigint':
     case 'int64':
     case 'hugeint':
-      // Use BigInt to preserve precision
       return BigInt(value);
 
     case 'varchar':
     case 'string':
     case 'text':
-      return String(value);
-
-    // ---- DATE / TIME / DATETIME ----
-    case 'date': {
-      // DuckDB DATE stored as YYYY-MM-DD
-      return new Date(value + 'T00:00:00Z');
-    }
-    case 'time': {
-      // DuckDB TIME stored as HH:MM:SS / HH:MM:SS.sss
-      // Return a string to avoid losing precision
-      return String(value);
-    }
-    case 'timestamp':
-    case 'datetime': {
-      // "YYYY-MM-DD HH:MM:SS" → valid ISO by replacing space with "T"
-      return new Date(value.replace(' ', 'T') + 'Z');
-    }
-    case 'timestamptz': {
-      // Already UTC-based in DuckDB
-      return new Date(value);
-    }
-
-    case 'blob':
-      if (Buffer.isBuffer(value)) return value; // already buffer
-      if (typeof value === 'string') return Buffer.from(value, 'base64');
-      return Buffer.from(value);
-
     case 'uuid':
       return String(value);
 
+    case 'date':
+      return new Date(value + 'T00:00:00Z');
+    case 'time':
+      return String(value);
+    case 'timestamp':
+    case 'datetime':
+      return new Date(value.replace(' ', 'T') + 'Z');
+    case 'timestamptz':
+      return new Date(value);
+
+    case 'blob':
+      if (Buffer.isBuffer(value)) return value;
+      if (typeof value === 'string') return Buffer.from(value, 'base64');
+      return Buffer.from(value);
+
     case 'list':
     case 'array':
-      return Array.isArray(value) ? value.map((v) => v) : JSON.parse(value);
+      return Array.isArray(value) ? value : JSON.parse(value);
 
     case 'struct':
+    case 'json':
       return typeof value === 'object' ? value : JSON.parse(value);
 
-    case 'json':
-      return JSON.parse(value);
-
     default:
-      return value; // fallback: return as-is
+      return value;
   }
 }
 
-export class Connection {
+class Connection {
   private baseUrl: string;
   private headers: HeadersInit;
 
   constructor(options: ConnectionOptions) {
-    this.baseUrl = options.baseUrl.replace(/\/$/, ''); // strip trailing /
+    this.baseUrl = options.baseUrl.replace(/\/$/, '');
     this.headers = {};
     if (options.apiKey) {
       this.headers['X-API-Key'] = options.apiKey;
     }
   }
 
-  private async _fetchNDJSON(sql: string): Promise<QueryResult> {
+  async fetchNDJSON(sql: string): Promise<QueryResult> {
     const url = `${this.baseUrl}?query=${encodeURIComponent(
       sql
     )}&default_format=JSONCompact`;
@@ -115,19 +100,69 @@ export class Connection {
     if (!res.ok) {
       throw new Error(`DuckDB HTTP error ${res.status}: ${await res.text()}`);
     }
-
     return res.json();
+  }
+}
+
+export class Database {
+  private connection: Connection;
+  private cacheTTL: number;
+  private inFlight: Map<string, Promise<TableData>> = new Map();
+  private resultCache: Map<string, { ts: number; data: TableData }> = new Map();
+
+  private constructor(options: ConnectionOptions) {
+    this.connection = new Connection(options);
+    this.cacheTTL = options.cacheTTL ?? 0; // default: no caching
+  }
+
+  static async connect(options: ConnectionOptions): Promise<Database> {
+    const db = new Database(options);
+    await db.all('SELECT 1');
+    return db;
   }
 
   private async _getQuery(sql: string): Promise<TableData> {
-    const { data: objects, meta: schema } = await this._fetchNDJSON(sql);
-    const rows = objects.map((obj) =>
-      Object.fromEntries(
-        schema.map((col, i) => [col.name, convertDuckDBValue(obj[i], col.type)])
-      )
-    );
+    const now = Date.now();
 
-    return rows;
+    // ✅ if cached result exists & still valid
+    const cached = this.resultCache.get(sql);
+    if (cached && this.cacheTTL > 0 && now - cached.ts < this.cacheTTL) {
+      return cached.data;
+    }
+
+    // ✅ if promise in flight → return same promise
+    if (this.inFlight.has(sql)) {
+      return this.inFlight.get(sql)!;
+    }
+
+    const promise = (async () => {
+      try {
+        const { data: objects, meta: schema } =
+          await this.connection.fetchNDJSON(sql);
+
+        const rows: TableData = objects.map((obj) =>
+          Object.fromEntries(
+            schema.map((col, i) => [
+              col.name,
+              convertDuckDBValue(obj[i], col.type)
+            ])
+          )
+        );
+
+        // store cache if TTL enabled
+        if (this.cacheTTL > 0) {
+          this.resultCache.set(sql, { ts: now, data: rows });
+        }
+
+        return rows;
+      } finally {
+        // cleanup in-flight map
+        this.inFlight.delete(sql);
+      }
+    })();
+
+    this.inFlight.set(sql, promise);
+    return promise;
   }
 
   async all(sql: string): Promise<TableData> {
@@ -135,8 +170,8 @@ export class Connection {
   }
 
   async each(sql: string, cb: (row: RowData) => void): Promise<void> {
-    const data = await this._getQuery(sql);
-    for (const row of data) cb(row);
+    const rows = await this._getQuery(sql);
+    for (const row of rows) cb(row);
   }
 
   async exec(sql: string): Promise<void> {
@@ -145,32 +180,5 @@ export class Connection {
 
   async run(sql: string): Promise<void> {
     await this._getQuery(sql);
-  }
-}
-
-export class Database {
-  private options: ConnectionOptions;
-
-  private constructor(options: ConnectionOptions) {
-    this.options = options;
-  }
-
-  static async connect(options: ConnectionOptions): Promise<Database> {
-    const db = new Database(options);
-    // test connection
-    await db.all('SELECT 1');
-    return db;
-  }
-
-  connect(): Connection {
-    return new Connection(this.options);
-  }
-
-  async all(sql: string): Promise<TableData> {
-    return new Connection(this.options).all(sql);
-  }
-
-  async exec(sql: string): Promise<void> {
-    return new Connection(this.options).exec(sql);
   }
 }
