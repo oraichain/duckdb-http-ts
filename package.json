@@ -23,6 +23,7 @@
   "author": "Oraichain Labs",
   "license": "MIT",
   "devDependencies": {
+    "@types/node": "^24.3.0",
     "typescript": "^5.5.0"
   }
 }
